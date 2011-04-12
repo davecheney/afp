@@ -30,8 +30,10 @@ var DSICommands = map[uint8]string{
 }
 
 type DSITransport struct {
-	net.Conn
+	conn net.Conn
 	clientNextId uint16
+	writeChan chan []byte
+	readChan chan []byte
 }
 
 func DialDSI(addr *net.TCPAddr) (*DSITransport, os.Error) {
@@ -39,12 +41,14 @@ func DialDSI(addr *net.TCPAddr) (*DSITransport, os.Error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = conn.Write(buildDSIRequest(DSIOpenSession, 1, []byte{}))
+	buf := buildDSIRequest(DSIOpenSession, 1, []byte{})
+	log.Println("Client:", dsiDecode(buf))
+	_, err = conn.Write(buf)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	buf := make([]byte, 1500)
+	buf = make([]byte, 1500)
 	read, err := io.ReadAtLeast(conn, buf, 16)
 	if err != nil {
 		conn.Close()
@@ -52,14 +56,17 @@ func DialDSI(addr *net.TCPAddr) (*DSITransport, os.Error) {
 	}
 	buf = buf[:read]
 	header, rest := buf[:16], buf[16:]
-	log.Println(dsiDecode(header))
-	log.Println(dsiDecodeOptions(rest))
+	log.Println("Server:", dsiDecode(header))
+	log.Println("Server:",dsiDecodeOptions(rest))
 	dsi := &DSITransport{
-		conn,
-		1,
+		conn: conn,
+		clientNextId: 1,
+		writeChan: make(chan []byte, 1),
+		readChan: make(chan []byte, 1),
 	}
 	go dsi.reader()
-	// go dsi.writer()
+	go dsi.writer()
+	go dsi.service()
 	return dsi, nil
 }
 
@@ -104,41 +111,51 @@ func dsiDecodeOptions(buf []byte) string {
 	return fmt.Sprintf("DSI Options %v", s)
 }
 
+func (d *DSITransport) service() {
+	for {
+ 		select {
+		case buf := <- d.readChan:
+			header := buf[:16]
+			switch header[1] {
+			case DSICloseSession:
+			case DSICommand:
+			case DSIGetStatus:
+
+			case DSITickle:
+				// tickle response
+				d.writeChan <- buildDSIResponse(DSITickle, binary.BigEndian.Uint16(header[2:4]), []byte{})
+			case DSIWrite:
+			case DSIAttention:
+			}
+		}
+	}
+}
+
 func (d *DSITransport) reader() {
-	defer d.Conn.Close()
+	defer d.conn.Close()
 	for {
 		buf := make([]byte, 1500)
-		read, err := io.ReadAtLeast(d.Conn, buf, 16)
+		_, err := io.ReadAtLeast(d.conn, buf, 16)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
-		header, rest := buf[0:16], buf[16:read]
-		length := binary.BigEndian.Uint16(header[8:12])
-		if len(rest) < int(length) {
-			buf := make([]byte, 0, int(length))
-			rest = append(buf, rest...)
-			_, err := io.ReadFull(d.Conn, rest) // TODO(dfc) wrong
-			if err != nil {
-				panic(err)
-			}
-		}
-		log.Println(dsiDecode(header))
-		switch header[1] {
-		case DSICloseSession:
-		case DSICommand:
-		case DSIGetStatus:
+		length := int(binary.BigEndian.Uint16(buf[8:12]))
+		_, err = io.ReadAtLeast(d.conn, buf[16:], length)
+		log.Println("Server:",dsiDecode(buf))
+		d.readChan <- buf
+	}
+}
 
-		case DSITickle:
-			// tickle response
-			_, err := d.Conn.Write(buildDSIResponse(DSITickle, binary.BigEndian.Uint16(header[2:4]), []byte{}))
+func (d *DSITransport) writer() {
+	for {
+		buf := <- d.writeChan
+		log.Println("Client:",dsiDecode(buf))
+		for len(buf) > 0 {
+			written, err := d.conn.Write(buf)
 			if err != nil {
-				return
+				log.Fatal(err)
 			}
-
-		case DSIWrite:
-		case DSIAttention:
-		default:
-			panic("unreachable")
+			buf = buf[written:]
 		}
 	}
 }
