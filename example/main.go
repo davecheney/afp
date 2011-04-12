@@ -5,8 +5,8 @@ import (
 	"flag"
 	"log"
 	"time"
-	
-	afp "github.com/davecheney/afp"	
+
+	afp "github.com/davecheney/afp"
 )
 
 func main() {
@@ -18,6 +18,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
- 
-	<- time.After(120e9)
+
+	<-time.After(120e9)
 }
