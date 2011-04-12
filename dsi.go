@@ -34,6 +34,7 @@ type DSITransport struct {
 	clientNextId uint16
 	writeChan chan []byte
 	readChan chan []byte
+ 	requests map[uint16]chan []byte
 }
 
 func DialDSI(addr *net.TCPAddr) (*DSITransport, os.Error) {
@@ -63,6 +64,7 @@ func DialDSI(addr *net.TCPAddr) (*DSITransport, os.Error) {
 		clientNextId: 1,
 		writeChan: make(chan []byte, 1),
 		readChan: make(chan []byte, 1),
+		requests: make(map[uint16]chan []byte),
 	}
 	go dsi.reader()
 	go dsi.writer()
