@@ -32,7 +32,7 @@ func (d *dsiHeader) isRequest() bool {
 }
 
 func (d *dsiHeader) isResponse() bool {
-	return !d.isRequest()
+	return d.flags == 0x01
 }
 
 func (d *dsiHeader) encode() []byte {
@@ -50,9 +50,9 @@ func decode(data []byte) (*dsiHeader, []byte) {
 	return &dsiHeader{
 		flags:           data[0],
 		command:         data[1],
-		requestId:       uint16(data[2]) | uint16(data[3])<<8,
-		errorCode:       uint32(data[4]) | uint32(data[5])<<8 | uint32(data[6])<<16 | uint32(data[7])<<24,
-		totalDataLength: uint32(data[8]) | uint32(data[9])<<8 | uint32(data[10])<<16 | uint32(data[11])<<24,
+		requestId:       uint16(data[3]) | uint16(data[2])<<8,
+		errorCode:       uint32(data[7]) | uint32(data[6])<<8 | uint32(data[5])<<16 | uint32(data[4])<<24,
+		totalDataLength: uint32(data[11]) | uint32(data[10])<<8 | uint32(data[9])<<16 | uint32(data[8])<<24,
 	}, data[16:]
 }
 
@@ -60,6 +60,7 @@ type dsiTransport struct {
 	conn   net.Conn
 	nextid uint16
 	mu     sync.Mutex // protects the request map and the nextId
+	outstanding map[uint16]chan interface{}
 }
 
 func dialDSI(network, addr string) (*dsiTransport, error) {
@@ -80,7 +81,7 @@ func dialDSI(network, addr string) (*dsiTransport, error) {
 	}
 	switch header.command {
 	case dsiOpenSession:
-		if header.isResponse() {
+		if !header.isResponse() {
 			t.conn.Close()
 			return nil, fmt.Errorf("dsi: dsiOpenSession response was not a response: %v", header)
 		}
@@ -88,6 +89,7 @@ func dialDSI(network, addr string) (*dsiTransport, error) {
 			t.conn.Close()
 			return nil, fmt.Errorf("dsi: RequestID did not match, expected=%d, actual=%d", id, header.requestId)
 		}
+		//fmt.Printf("dsiOpenSession presented extra data: %v\n", body)	
 		go t.mainloop()
 		return t, nil
 	default:
@@ -101,6 +103,7 @@ func newTransport(conn net.Conn) *dsiTransport {
 	return &dsiTransport{
 		conn:   conn,
 		nextid: uint16(rand.Int31n(65536)),
+		outstanding: make(map[uint16]chan interface{}),
 	}
 }
 
@@ -120,11 +123,21 @@ func (d *dsiTransport) mainloop() {
 			fmt.Printf("dsi: read packet failed: %v\n", err)
 			break
 		}
+		fmt.Println(header, body)
 		switch header.command {
 		case dsiCloseSession:
 		case dsiCommand:
 		case dsiGetStatus:
+                        ch, ok := d.outstanding[header.requestId]
+                        if !ok {
+                                fmt.Printf("dsi: unexpected response %d\n", header.requestId)
+                        }
+                        ch <- body
+                        close(ch)
+                        delete(d.outstanding, header.requestId)
+
 		case dsiTickle:
+			fmt.Printf("dsi: tickle %d\n", header.requestId)
 		case dsiWrite:
 		case dsiAttention:
 		default:
@@ -136,15 +149,18 @@ func (d *dsiTransport) mainloop() {
 }
 
 func (d *dsiTransport) openSession() (uint16, error) {
-	h := &dsiHeader{
-		flags:     0x0,
-		command:   dsiOpenSession,
-		requestId: d.nextId(),
-	}
-	if _, err := d.conn.Write(h.encode()); err != nil {
+	h := d.nextRequestHeader(dsiOpenSession)
+	if err := d.writePacketRaw(h, nil); err != nil {
 		return 0, err
 	}
 	return h.requestId, nil
+}
+
+func (d *dsiTransport) nextRequestHeader(command uint8) *dsiHeader {
+	return &dsiHeader{
+		command: command,
+		requestId: d.nextId(),
+	}
 }
 
 func (d *dsiTransport) readPacket() (*dsiHeader, []byte, error) {
@@ -160,4 +176,36 @@ func (d *dsiTransport) readPacket() (*dsiHeader, []byte, error) {
 		}
 	}
 	return header, body, nil
+}
+
+func (d *dsiTransport) writePacket(header *dsiHeader, buf []byte) chan interface{} {
+	header.totalDataLength = uint32(len(buf))
+	ch := make(chan interface{}, 1)
+	d.outstanding[header.requestId] = ch
+	if err := d.writePacketRaw(header, buf); err != nil {
+		ch <- err
+	}
+	return ch
+}
+
+func (d *dsiTransport) writePacketRaw(header *dsiHeader, buf []byte) error {
+	_, err := d.conn.Write(append(header.encode(), buf...))
+	return err
+}
+
+func (d *dsiTransport) getStatus() interface{} {
+	h := &dsiHeader{
+		flags: 0x0,
+		command: dsiGetStatus,
+		requestId: d.nextId(),
+	}
+	return <- d.writePacket(h, []byte { 15, 0 })
+}
+
+func (d *dsiTransport) Close() error {
+	err := d.writePacketRaw(d.nextRequestHeader(dsiCloseSession), nil)
+	if err != nil {
+		return err
+	}
+	return d.conn.Close()
 }
