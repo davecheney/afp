@@ -116,39 +116,37 @@ func (s *Session) nextId() uint16 {
 }
 
 func (s *Session) mainloop() {
-	ch := make(chan p, 1)
+	ch := make(chan *p, 1)
 	go s.transport.mainloop(ch)
+	defer s.cleanup()
 	for {
 		select {
-		case p, ok := <-ch:
+		case p := <-ch:
 			fmt.Println(p)
-			if !ok {
-				// closed, shutdown
-				break
-			}
-			switch p.header.command {
+			switch p.command {
 			case dsiCloseSession:
 			case dsiCommand:
 			case dsiGetStatus:
-				ch, ok := s.outstanding[p.header.requestId]
+				ch, ok := s.outstanding[p.requestId]
 				if !ok {
-					fmt.Printf("dsi: unexpected response %d\n", p.header.requestId)
+					fmt.Printf("dsi: unexpected response %d\n", p.requestId)
 				}
 				ch <- p.body
 				close(ch)
-				delete(s.outstanding, p.header.requestId)
-
+				delete(s.outstanding, p.requestId)
 			case dsiTickle:
-				fmt.Printf("dsi: tickle %d\n", p.header.requestId)
+				fmt.Printf("dsi: tickle %d\n", p.requestId)
 			case dsiWrite:
 			case dsiAttention:
 			default:
-				fmt.Printf("dsi: unexpected command: %d\n", p.header.command)
-				break
+				fmt.Printf("dsi: unexpected command: %d\n", p.command)
+				return
 			}
+		default:
+			println("closed")
+			return
 		}
 	}
-	fmt.Println("dsi: mainloop exited")
 }
 
 type p struct {
@@ -156,7 +154,7 @@ type p struct {
 	body []byte
 }
 
-func (t *transport) mainloop(ch chan p) {
+func (t *transport) mainloop(ch chan *p) {
 	defer t.conn.Close()
 	for {
 		header, body, err := t.readPacket()
@@ -164,11 +162,12 @@ func (t *transport) mainloop(ch chan p) {
 			close(ch)
 			break
 		}
-		ch <- p{
+		ch <- &p{
 			header,
 			body,
 		}
 	}
+	println("dsi.transport: closed")
 }
 
 func (s *Session) openSession() (uint16, error) {
@@ -209,6 +208,13 @@ func (s *Session) writePacket(header *header, buf []byte) chan interface{} {
 		ch <- err
 	}
 	return ch
+}
+
+func (s *Session) cleanup() {
+	for _, ch := range s.outstanding {
+		ch <- io.EOF
+		close(ch)
+	}
 }
 
 func (t *transport) writePacket(header *header, buf []byte) error {
